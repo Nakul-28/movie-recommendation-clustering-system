@@ -35,6 +35,7 @@ class ContentBasedClusteringRecommender:
         
         # Encoders and scalers
         self.tfidf = TfidfVectorizer(max_features=5000, stop_words='english')
+        self.tfidf_title = TfidfVectorizer(max_features=5000, stop_words='english')
         self.mlb_genres = MultiLabelBinarizer()
         self.mlb_keywords = MultiLabelBinarizer()
         self.mlb_cast = MultiLabelBinarizer()
@@ -72,6 +73,8 @@ class ContentBasedClusteringRecommender:
             cols_to_keep.append('cast')
         if 'director' in df_movies.columns:
             cols_to_keep.append('director')
+        if 'popularity' in df_movies.columns:
+            cols_to_keep.append('popularity')
             
         self.df = df_movies[cols_to_keep].copy()
         
@@ -98,30 +101,31 @@ class ContentBasedClusteringRecommender:
         """
         print("Engineering features...")
         
+        self.feature_matrices = {}
+        
+        # 0. TF-IDF on Title
+        self.feature_matrices['title'] = self.tfidf_title.fit_transform(self.df['title'])
+        
         # 1. TF-IDF on Overview
-        overview_features = self.tfidf.fit_transform(self.df['overview'])
+        self.feature_matrices['overview'] = self.tfidf.fit_transform(self.df['overview'])
         
         # 2. Multi-hot Encoding on Genres
-        genres_features = self.mlb_genres.fit_transform(self.df['genres'])
+        self.feature_matrices['genres'] = self.mlb_genres.fit_transform(self.df['genres'])
         
         # 3. Multi-hot Encoding on Keywords
-        keywords_features = self.mlb_keywords.fit_transform(self.df['keywords'])
-        
-        features_list = [overview_features, genres_features, keywords_features]
+        self.feature_matrices['keywords'] = self.mlb_keywords.fit_transform(self.df['keywords'])
         
         # 4. Multi-hot Encoding on Cast (Optional but included)
         if 'cast' in self.df.columns:
-            cast_features = self.mlb_cast.fit_transform(self.df['cast'])
-            features_list.append(cast_features)
+            self.feature_matrices['cast'] = self.mlb_cast.fit_transform(self.df['cast'])
             
         # 5. Multi-hot Encoding on Director
         if 'director' in self.df.columns:
             director_series = self.df['director'].apply(lambda x: [str(x).replace(" ", "").lower()] if pd.notna(x) else [])
-            director_features = self.mlb_director.fit_transform(director_series)
-            features_list.append(director_features)
+            self.feature_matrices['director'] = self.mlb_director.fit_transform(director_series)
             
         # Combine all features into a single sparse matrix
-        self.features_matrix = hstack(features_list)
+        self.features_matrix = hstack(list(self.feature_matrices.values()))
         print(f"Feature matrix created. Shape: {self.features_matrix.shape}")
 
     def reduce_dimensionality(self):
@@ -219,31 +223,51 @@ class ContentBasedClusteringRecommender:
         if len(cluster_indices) <= 1:
             return "Not enough movies in the cluster to make a recommendation."
 
-        # Extract features for the target movie and cluster movies
-        target_features = self.reduced_features[movie_idx].reshape(1, -1)
-        cluster_features = self.reduced_features[cluster_indices]
+        # 2. Compute Cosine Similarity as a weighted sum of individual feature similarities
+        similarities = np.zeros(len(cluster_indices))
         
-        # 2. Compute Cosine Similarity
-        similarities = cosine_similarity(target_features, cluster_features).flatten()
+        # Adjust coefficients where title, keywords, overview: highest priority 
+        # genre, cast, director: slightly lower
+        coefficients = {
+            'title': 2.0,
+            'keywords': 2.0,
+            'overview': 2.0,
+            'genres': 1.0,
+            'cast': 1.0,
+            'director': 1.0
+        }
         
-        # 3. Sort and get top_N similar movies within the cluster
-        # Using argsort to sort descending
-        sim_indices = similarities.argsort()[::-1]
-        
+        for feat_name, feat_matrix in self.feature_matrices.items():
+            coef = coefficients.get(feat_name, 1.0)
+            target_feat = feat_matrix[movie_idx]
+            cluster_feat = feat_matrix[cluster_indices]
+            sim = cosine_similarity(target_feat, cluster_feat).flatten()
+            similarities += coef * sim
+            
         print(f"\n--- Recommendations for '{match['title'].values[0]}' (Cluster: {movie_cluster}) ---")
-        recommendations = []
-        found = 0
         
-        for idx in sim_indices:
-            actual_idx = cluster_indices[idx]
+        # 3. Sort by similarity to find top candidates, then rank by popularity
+        candidates = []
+        for i, actual_idx in enumerate(cluster_indices):
             if actual_idx != movie_idx: # Skip the movie itself
-                similarity_score = similarities[idx]
-                sim_movie_title = self.df.loc[actual_idx, 'title']
-                recommendations.append((sim_movie_title, similarity_score))
-                print(f"{found+1}. {sim_movie_title} (Cosine Sim: {similarity_score:.4f})")
-                found += 1
-                if found == top_n:
-                    break
+                candidates.append({
+                    'title': self.df.loc[actual_idx, 'title'],
+                    'similarity': similarities[i],
+                    'popularity': self.df.loc[actual_idx, 'popularity'] if 'popularity' in self.df.columns else 0.0
+                })
+        
+        # Filter top similar candidates first, then sort by popularity
+        candidates.sort(key=lambda x: x['similarity'], reverse=True)
+        top_candidates = candidates[:max(top_n * 4, 20)]
+        top_candidates.sort(key=lambda x: x['popularity'], reverse=True)
+        
+        recommendations = []
+        for i, cand in enumerate(top_candidates[:top_n]):
+            sim_movie_title = cand['title']
+            similarity_score = cand['similarity']
+            pop_score = cand['popularity']
+            recommendations.append((sim_movie_title, similarity_score, pop_score))
+            print(f"{i+1}. {sim_movie_title} (Weighted Sim: {similarity_score:.4f}, Popularity: {pop_score:.2f})")
                     
         return recommendations
 
